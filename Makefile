@@ -1,0 +1,77 @@
+SHELL := /bin/bash
+
+# Pin the toolchain: go.mod declares `go 1.22` as a floor, and letting Go
+# auto-download a newer toolchain would silently diverge from the Docker builder.
+export GOTOOLCHAIN := local
+
+DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/jobtracker?sslmode=disable
+export DATABASE_URL
+
+STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
+IMAGE := job-tracker-api
+
+.PHONY: help tidy fmt vet lint build dev migrate db-up db-down db-reset psql test test-integration docker-build
+
+help:
+	@echo "db-up            start postgres and wait for it to accept connections"
+	@echo "db-down          stop postgres (keeps the volume)"
+	@echo "db-reset         stop postgres and delete the volume"
+	@echo "migrate          apply migrations against DATABASE_URL"
+	@echo "dev              run the api on the host"
+	@echo "test             unit tests"
+	@echo "test-integration unit + integration tests (needs db-up)"
+	@echo "lint             go vet + staticcheck"
+	@echo "build            build ./bin/api"
+	@echo "docker-build     build the production image"
+	@echo "psql             psql shell inside the postgres container"
+
+tidy:
+	go mod tidy
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+lint: vet
+	go run $(STATICCHECK) ./...
+
+build:
+	go build -trimpath -o bin/api ./cmd/api
+
+dev:
+	go run ./cmd/api
+
+migrate:
+	go run ./cmd/api -migrate-only
+
+db-up:
+	docker compose up -d postgres
+	@printf 'waiting for postgres'
+	@for i in $$(seq 1 30); do \
+		if docker compose exec -T postgres pg_isready -U postgres -d jobtracker >/dev/null 2>&1; then \
+			echo " ready"; exit 0; \
+		fi; \
+		printf '.'; sleep 1; \
+	done; \
+	echo " timed out"; exit 1
+
+db-down:
+	docker compose down
+
+db-reset:
+	docker compose down -v
+
+psql:
+	docker compose exec postgres psql -U postgres -d jobtracker
+
+test:
+	go test -count=1 ./...
+
+test-integration:
+	go test -tags=integration -count=1 ./...
+
+docker-build:
+	docker build -t $(IMAGE) .
+	@docker images $(IMAGE) --format 'image size: {{.Size}}'

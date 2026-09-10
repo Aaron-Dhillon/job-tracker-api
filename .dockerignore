@@ -1,0 +1,8 @@
+.git
+.github
+.env
+bin/
+docs/
+CLAUDE.md
+README.md
+docker-compose.yml
