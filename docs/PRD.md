@@ -85,7 +85,7 @@ status_transitions (
   application_id uuid not null references applications(id) on delete cascade,
   from_status text not null,
   to_status   text not null,
-  changed_by  uuid not null references users(id),
+  changed_by  uuid not null references users(id) on delete cascade,
   changed_at  timestamptz not null default now()
 )
 ```
@@ -138,7 +138,14 @@ GET    /admin/users                  admin only
 GET    /healthz                      no auth, returns {"status":"ok"} and checks DB ping
 ```
 
-`?q=` performs full-text search: `where search_vec @@ plainto_tsquery('english', $1)` ordered by `ts_rank`. Company name is included by joining `companies` and OR-ing an `ilike` on name, so "Visa" finds applications at Visa.
+`?q=` performs full-text search as a **UNION of two ranked branches**, not a single OR'd predicate:
+
+1. **Text branch** — `where search_vec @@ plainto_tsquery('english', $1)`, ranked by `ts_rank(search_vec, plainto_tsquery('english', $1))`.
+2. **Company branch** — `join companies c ... where c.name ilike '%' || $1 || '%'`, assigned a fixed rank of `1.0`.
+
+The branches are `union all`-ed, deduplicated by `max(rank)` per application id, then ordered `rank desc, applied_on desc, id`. A row matching both branches keeps the higher score. The fixed `1.0` deliberately outranks typical `ts_rank` values (~0.01-0.1), so an exact company match sorts above a body-text match — searching "Visa" surfaces applications *at* Visa ahead of ones that merely mention Visa in the notes.
+
+Splitting the branches (rather than OR-ing them in one `where`) is what keeps the tsvector predicate index-eligible: Postgres plans branch 1 as a Bitmap Index Scan on `applications_search_idx`, which an OR against a non-indexed `ilike` would defeat.
 
 `POST /applications` upserts the company by name (`insert ... on conflict (name) do update set name = excluded.name returning id`).
 
@@ -164,7 +171,7 @@ Render service is Docker-based, builds from `Dockerfile`, env vars `DATABASE_URL
 
 ## Docker
 
-- `Dockerfile`: multi-stage, `golang:1.22` builder → `gcr.io/distroless/static` runtime, static binary (`CGO_ENABLED=0`). Final image well under 30 MB.
+- `Dockerfile`: multi-stage, `golang:1.26` builder → `gcr.io/distroless/static` runtime, static binary (`CGO_ENABLED=0`). Final image well under 30 MB. (The builder must be at least the `go` directive in `go.mod`, which `golang-migrate/v4` pins to 1.25.11 — still inside the "Go 1.22+" floor above.)
 - `docker-compose.yml`: `api` (build .) + `postgres:16` with a named volume; `api` depends_on postgres healthcheck. `make run` = `docker compose up --build`.
 
 ## README (must exist, short)
