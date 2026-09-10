@@ -120,7 +120,13 @@ withdrawn    -> (terminal)
 
 ## Endpoints
 
-All JSON. Errors are `{"error": "message"}` with appropriate status.
+All JSON. Errors are `{"error": "message"}` with appropriate status, with one documented extension: an invalid transition (409) also carries `from` and `allowed`, so a client can render the legal next moves without hardcoding the state machine.
+
+```json
+{"error": "invalid transition", "from": "offer", "allowed": ["rejected", "withdrawn"]}
+```
+
+`allowed` is always an array, empty for a terminal state, never null. A `to` value that is not a state at all is a different failure: 400 `{"error": "unknown state"}`, plain shape.
 
 ```
 POST   /auth/register
@@ -131,7 +137,7 @@ POST   /applications                 create {company_name, role_title, location?
 GET    /applications/{id}
 PATCH  /applications/{id}            update role_title/location/notes/applied_on only (not status)
 DELETE /applications/{id}
-POST   /applications/{id}/transition {to: "screening"}   -> 409 on invalid transition
+POST   /applications/{id}/transition {to: "screening"}   -> 409 (+from/allowed) invalid, 400 unknown state
 GET    /applications/{id}/history    list status_transitions for the application
 
 GET    /admin/users                  admin only

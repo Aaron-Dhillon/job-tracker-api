@@ -11,7 +11,7 @@ every phase and show the output.
 
 ## Current state
 
-Phase 1 is done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose. Phases 2-6 are not started.
+Phases 1-2 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, and `internal/workflow`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase. Phases 3-6 are not started.
 
 `docs/PRD.md` is the authoritative spec. `docs/PLAN.md` is the six-phase build order derived from it — it records which files each phase adds, the tests that prove it, and every place the PRD was ambiguous along with the decision taken. Read both before writing anything.
 
@@ -38,7 +38,7 @@ Layering is package-per-domain under `internal/`, each owning its model, repo (r
 
 Two pieces carry the design weight:
 
-**`internal/workflow`** — a pure state machine with no DB or HTTP dependency: a `map[State][]State` transition table and `Transition(from, to State) error` returning `ErrInvalidTransition`. `rejected` and `withdrawn` are terminal. Handlers call `Transition` *before* writing, then update `applications.status` and insert a `status_transitions` audit row **in the same transaction**. Invalid transitions surface as HTTP 409.
+**`internal/workflow`** — a pure state machine with no DB or HTTP dependency: a `map[State][]State` transition table and `Transition(from, to State) error` returning `ErrInvalidTransition`. `rejected` and `withdrawn` are terminal. Handlers call `Transition` *before* writing, then update `applications.status` and insert a `status_transitions` audit row **in the same transaction**. Invalid transitions surface as HTTP 409 with `from` and `allowed` (from `workflow.Next(from)`) alongside the error; an unrecognised target state is 400, not 409.
 
 **`internal/auth`** — JWT HS256 issue/verify plus two middlewares: `RequireAuth` (parses bearer token, 401 on missing/invalid/expired, injects user id + role into request context) and `RequireRole("admin")` (403 otherwise). Ownership is enforced at the query level, not just in middleware: a `user` role sees only rows where `user_id` matches their token claim, and a non-owner requesting someone else's application gets **404, not 403** (deliberate — don't leak existence).
 

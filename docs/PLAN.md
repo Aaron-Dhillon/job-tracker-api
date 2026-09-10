@@ -89,6 +89,8 @@ Plus: `errors.Is(err, ErrInvalidTransition)` holds; unknown states on either sid
 
 **Done when:** `go test -cover ./internal/workflow` reports **100.0%**.
 
+`Next` returns a non-nil empty slice for a terminal state and nil only for an unknown one, so the 409 body's `allowed` field marshals as `[]` rather than `null` — which is the commonest 409, since transitioning out of `rejected` or `withdrawn` is what users try. `TestNext_MarshalsForErrorBody` pins the exact JSON.
+
 ---
 
 ## Phase 3 — `internal/auth` + `internal/httpx` (~60 min)
@@ -140,7 +142,7 @@ The bulk of the work. Everything before this was foundations.
 | `internal/applications/model.go` | `Application`, `Transition`, `CreateInput`, `PatchInput` (nullable fields as `*string`). |
 | `internal/applications/repo.go` | `Create` (tx: company upsert → insert), `Get`, `List`, `Update`, `Delete`, `Transition` (tx), `History`. |
 | `internal/applications/search.go` | Dynamic WHERE builder — see the index note below. |
-| `internal/applications/handlers.go` | All seven `/applications` routes. |
+| `internal/applications/handlers.go` | All seven `/applications` routes. The transition handler maps `workflow.ErrUnknownState` → 400 and `workflow.ErrInvalidTransition` → 409, and the 409 body carries `from` plus `workflow.Next(from)` as `allowed` (PRD §Endpoints). |
 | `internal/server/router.go` | **New file, not in the PRD layout.** `New(deps) http.Handler` — chi router, all routes, middleware stack. Exists so integration tests build the *same* router `main.go` serves; `package main` can't be imported, and duplicated wiring drifts. |
 | `cmd/api/main.go` | Full wiring: env → pool → migrate → `EnsureAdmin` if env set → `server.New` → `ListenAndServe` with graceful shutdown. |
 | `Makefile` | Complete: add `run`, `build`, `seed-admin`. |
@@ -164,7 +166,7 @@ Ownership: non-admins get `user_id = $n` appended to the list query; single-item
 | 3 | Login | 200 + token; wrong password → 401 (identical body to unknown email) |
 | 4 | Create ×2, same company | both 201; `companies` holds exactly **one** row (proves the upsert) |
 | 5 | Read | owner 200; **non-owner 404**; no token 401 |
-| 6 | Transition | `applied→screening` 200; history has 1 row; **`screening→applied` 409**; from `rejected` → 409 |
+| 6 | Transition | `applied→screening` 200; history has 1 row; **`screening→applied` 409**; from `rejected` → 409. The 409 body matches `{"error":"invalid transition","from":...,"allowed":[...]}`, with `allowed` an empty array (not null) from a terminal state; `{"to":"bogus"}` → **400**, not 409 |
 | 7 | PATCH | updates `role_title`, bumps `updated_at`; **`status` in body → 400** |
 | 8 | Search | `?q=` matches on notes/title, top-ranked row correct; `?q=Visa` matches via company name |
 | 9 | Filters | `?status=` filters; `?limit=`/`?offset=` page correctly |
