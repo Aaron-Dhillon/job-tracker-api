@@ -1,7 +1,9 @@
 SHELL := /bin/bash
 
-# Pin the toolchain: go.mod declares `go 1.22` as a floor, and letting Go
-# auto-download a newer toolchain would silently diverge from the Docker builder.
+# Pin the toolchain: the floor lives in go.mod (currently 1.25.11, set by
+# golang-migrate), and letting Go auto-download a newer toolchain would silently
+# diverge from the Docker builder. Do not restate the version here -- CI reads it
+# from go.mod via go-version-file, and a second copy is a second thing to drift.
 export GOTOOLCHAIN := local
 
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/jobtracker?sslmode=disable

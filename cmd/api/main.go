@@ -1,13 +1,12 @@
 // Command api is the job tracker HTTP server. It applies database migrations on
 // start before listening, so a container deploy is self-contained.
 //
-// Phase 1 skeleton: configuration, migrations, and /healthz only. Route wiring
-// moves to internal/server in phase 4.
+// Phase 1-3 skeleton: configuration, migrations, and /healthz only. Route
+// wiring moves to internal/server in phase 4.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -22,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/db"
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/httpx"
 )
 
 func main() {
@@ -112,18 +112,9 @@ func healthz(pool *pgxpool.Pool) http.HandlerFunc {
 
 		if err := pool.Ping(ctx); err != nil {
 			log.Printf("healthz: ping failed: %v", err)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database unavailable"})
+			httpx.WriteError(w, http.StatusServiceUnavailable, "database unavailable")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}
-}
-
-// writeJSON is a placeholder; internal/httpx takes this over in phase 3.
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Printf("write response: %v", err)
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }

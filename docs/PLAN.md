@@ -103,14 +103,16 @@ Plus: `errors.Is(err, ErrInvalidTransition)` holds; unknown states on either sid
 |---|---|
 | `internal/httpx/json.go` | `WriteJSON(w, status, v)`, `WriteError(w, status, msg)`, `Decode(w, r, &v) error` wrapping `http.MaxBytesReader` (1 MB) + `DisallowUnknownFields`. |
 | `internal/auth/password.go` | `HashPassword` (bcrypt **cost 12**), `CheckPassword`. |
-| `internal/auth/jwt.go` | `Claims{jwt.RegisteredClaims; Role string}`; `Issuer{secret, ttl}` with `Issue(userID uuid.UUID, role string)` and `Verify(tok string)`. `sub` = user UUID, 24h expiry, `iat`. |
-| `internal/auth/context.go` | Unexported `ctxKey`; `Principal{ID uuid.UUID; Role string}`; `WithPrincipal` / `PrincipalFrom`. |
-| `internal/auth/middleware.go` | `RequireAuth(v Verifier)`, `RequireRole(role string)`. |
+| `internal/auth/jwt.go` | `Claims{jwt.RegisteredClaims; Role string}`; `Issuer{secret, ttl}` with `Issue(userID uuid.UUID, role string)` and `Verify(tok string) (Principal, error)`. `sub` = user UUID, 24h expiry, `iat`. `NewIssuer` rejects a secret under `MinSecretLen` (32). |
+| `internal/auth/context.go` | Unexported `ctxKey`; `Principal{ID uuid.UUID; Role string}`; `WithPrincipal` / `PrincipalFrom`; `RoleUser`/`RoleAdmin`/`ValidRole`. |
+| `internal/auth/middleware.go` | `RequireAuth(v Verifier)`, `RequireRole(role string)`. `Verifier` is the one-method interface `Issuer` satisfies, so the middleware is testable with a stub. |
 
-Two things to get right, both worth being able to explain:
+Four things to get right, all worth being able to explain:
 
-- `Verify` must pass **`jwt.WithValidMethods([]string{"HS256"})`**. Without it the parser will honour `alg: none` or an RS256 header, which is the classic JWT forgery.
-- Login returns one identical 401 for unknown-email and wrong-password. Never leak which.
+- `Verify` must pass **`jwt.WithValidMethods([]string{"HS256"})`**. Without it the parser honours the `alg` header the *client* chose. The live risk is `RS256`: the library hands our HMAC secret to the RSA verifier as a public key, and a public key is not a secret. **A mutation test settled what this actually defends:** removing `WithValidMethods` is caught by `TestVerify_RejectsOtherAlgorithms` (HS384/HS512), *not* by the `alg: none` test — golang-jwt v5 separately refuses the `none` method unless the keyfunc returns its `UnsafeAllowNoneSignatureType` sentinel. Both tests stay; the allowlist is the defence we own, the library guard is one we inherit.
+- **`JWT_SECRET` must be ≥ 32 bytes** (`MinSecretLen`), enforced at `NewIssuer`. RFC 7518 §3.2 requires an HMAC key at least as long as the hash output; a short secret is brute-forceable offline from one captured token, and then anyone mints an admin. `.env.example` was updated — **the Render env var must be rotated to a 32-byte value before Phase 4 deploys**, or the container will refuse to start.
+- Login returns one identical 401 for unknown-email and wrong-password. Never leak which — including in *timing*. `auth.DummyCheck` runs a real bcrypt comparison against a throwaway hash when no user matched, so an unknown email costs the same ~250ms as a known one. Identical bodies with a 250ms-versus-0ms split still answers "is this address registered?".
+- `RequireRole` answers **401, not 403**, when there is no principal at all: that means the route was mounted without `RequireAuth`, and 403 would claim the caller was identified and rejected.
 
 Note `bcrypt` errors on passwords over 72 bytes (`ErrPasswordTooLong`) rather than truncating — the register handler maps that to 400 in Phase 4.
 
@@ -124,6 +126,10 @@ Note `bcrypt` errors on passwords over 72 bytes (`ErrPasswordTooLong`) rather th
 **Verify:** `make test` (unit only — still no DB dependency)
 
 **Done when:** `go test ./internal/auth/... ./internal/httpx/...` passes and `make lint` is clean.
+
+**Done.** `auth` 98.7% coverage, `httpx` 97.7%; the uncovered remainder is the HMAC signing-failure branch and the `decodeError` fallback, neither reachable with a valid key and a real `*http.Request`. Five mutations were caught: dropped `WithValidMethods`, cost 12→10, `RequireRole` 401→403 with no principal, dropped `DisallowUnknownFields`, and leaking the verifier's reason into the 401 body. `cmd/api/main.go` now uses `httpx` and the placeholder `writeJSON` is gone.
+
+`Decode` returns `*httpx.Error` carrying a status, so an oversized body is **413** and everything else 400; handlers call `httpx.WriteDecodeError(w, err)` rather than hardcoding 400. The request-id echo named in Phase 4 stays in Phase 4 — it needs the router to be testable end to end.
 
 ---
 
@@ -248,6 +254,9 @@ No separate migrate step is needed — the test harness calls `db.Up`. (The PRD 
 | `?q=` implementation | UNION of a ts_rank'd text branch and a fixed-rank-1.0 company branch; **PRD §Endpoints rewritten** |
 | Dockerfile timing | Built in Phase 1 to enable an early Render deploy |
 | `limit` over 100 | **Clamped** to 100, not rejected |
+| `JWT_SECRET` length | **Minimum 32 bytes**, enforced at `NewIssuer` (RFC 7518 §3.2). Rotate the Render value before Phase 4 |
+| UUID handling | `github.com/google/uuid` for `Principal.ID` and the `sub` claim. Not named in PRD §Stack, but it is a parse-and-validate step, not a substitute for anything listed — a malformed `sub` is rejected at `Verify` instead of reaching SQL |
+| Oversized request body | **413**, not 400 — the body is well-formed, just over the 1 MB cap |
 
 ### Internal conflicts in the PRD
 
@@ -293,4 +302,5 @@ No separate migrate step is needed — the test harness calls `db.Up`. (The PRD 
 | No host `psql` | Manual DB inspection goes through `docker compose exec postgres psql` |
 | No `migrate` CLI | Migrations run from Go via embedded SQL — which is what the distroless image needs anyway |
 | Go 1.27.1 local vs. `go 1.25.11` in `go.mod` | Handled: `GOTOOLCHAIN=local` is exported by the Makefile and set in the Dockerfile, so no toolchain is auto-downloaded and the builder fails loudly if it is too old |
+| `go get` silently raises the `go` directive | Adding the Phase-3 deps bumped `go.mod` from `1.25.11` to `1.26.0` (via a transitive `x/crypto` that wanted it), and `go mod tidy` **never lowers it back**. Pinned `x/crypto v0.53.0`, reset the directive by hand, confirmed with `go list -m -f '{{.GoVersion}}' all` that nothing else demands more. Check `head -3 go.mod` after any `go get` — the Dockerfile builder tag is the thing that breaks |
 | ~~Default branch is `master`~~ | **Fixed** — renamed to `main` |

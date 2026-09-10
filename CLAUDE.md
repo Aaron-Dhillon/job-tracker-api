@@ -11,7 +11,9 @@ every phase and show the output.
 
 ## Current state
 
-Phases 1-2 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, and `internal/workflow`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase. Phases 3-6 are not started.
+Phases 1-3 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, `internal/workflow`, and `internal/auth` + `internal/httpx`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase. Phases 4-6 are not started.
+
+**Before Phase 4 deploys:** `JWT_SECRET` on Render must be at least 32 bytes or the container will refuse to start (see `auth.MinSecretLen`).
 
 `docs/PRD.md` is the authoritative spec. `docs/PLAN.md` is the six-phase build order derived from it — it records which files each phase adds, the tests that prove it, and every place the PRD was ambiguous along with the decision taken. Read both before writing anything.
 
@@ -40,9 +42,15 @@ Two pieces carry the design weight:
 
 **`internal/workflow`** — a pure state machine with no DB or HTTP dependency: a `map[State][]State` transition table and `Transition(from, to State) error` returning `ErrInvalidTransition`. `rejected` and `withdrawn` are terminal. Handlers call `Transition` *before* writing, then update `applications.status` and insert a `status_transitions` audit row **in the same transaction**. Invalid transitions surface as HTTP 409 with `from` and `allowed` (from `workflow.Next(from)`) alongside the error; an unrecognised target state is 400, not 409.
 
-**`internal/auth`** — JWT HS256 issue/verify plus two middlewares: `RequireAuth` (parses bearer token, 401 on missing/invalid/expired, injects user id + role into request context) and `RequireRole("admin")` (403 otherwise). Ownership is enforced at the query level, not just in middleware: a `user` role sees only rows where `user_id` matches their token claim, and a non-owner requesting someone else's application gets **404, not 403** (deliberate — don't leak existence).
+**`internal/auth`** — JWT HS256 issue/verify plus two middlewares: `RequireAuth` (parses bearer token, 401 on missing/invalid/expired, injects a `Principal` into request context) and `RequireRole("admin")` (403 otherwise; **401 when there is no principal at all**, which means the route was mounted without `RequireAuth`). Ownership is enforced at the query level, not just in middleware: a `user` role sees only rows where `user_id` matches their token claim, and a non-owner requesting someone else's application gets **404, not 403** (deliberate — don't leak existence).
 
-`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding, the `{"error": "..."}` response shape, and request IDs. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
+Three invariants there that are easy to undo by accident, each pinned by a test that a mutation check confirmed will fail:
+
+- `Verify` passes `jwt.WithValidMethods` so the `alg` header a client sends cannot select the algorithm. What that actually catches is RS256/HS384/HS512 confusion — `alg: none` is separately refused by golang-jwt v5 unless the keyfunc returns its unsafe sentinel. Don't repeat the folk version of this; the comment in `jwt.go` has it right.
+- `NewIssuer` rejects a `JWT_SECRET` under 32 bytes (RFC 7518 §3.2). HS256 is only as strong as its key.
+- Every auth failure is one identical 401 body, and `auth.DummyCheck` keeps unknown-email login *timing* identical too. Do not add a more helpful message.
+
+`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding and the `{"error": "..."}` response shape (request-id echo lands in phase 4 with the router). `httpx.Decode` caps bodies at 1 MB, rejects unknown fields and trailing content, and returns a `*httpx.Error` carrying the status — so handlers call `httpx.WriteDecodeError(w, err)` and an oversized body is a 413 rather than a blanket 400. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
 
 **Search** — `applications.search_vec` is a *generated stored* tsvector column over role_title/location/notes with a GIN index. Note the two-argument `to_tsvector('english', ...)`: the one-argument form is only STABLE and a generated column requires IMMUTABLE.
 
