@@ -13,7 +13,7 @@ every phase and show the output.
 
 Phases 1-3 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, `internal/workflow`, and `internal/auth` + `internal/httpx`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase.
 
-Phase 4 is built apart from the integration suite: `internal/users`, `internal/applications`, `internal/server/router.go`, the full `cmd/api/main.go`, and DB-free unit tests for search SQL, the JSON date and `Optional[T]`, user validation, and router wiring. `test/integration` is the remaining piece. Phases 5-6 are not started.
+Phase 4 is done: `internal/users`, `internal/applications`, `internal/server/router.go`, the full `cmd/api/main.go`, DB-free unit tests, and `test/integration` — 12 scenarios over a real Postgres, 9.3s. Phases 5-6 are not started.
 
 **Before Phase 4 deploys:** `JWT_SECRET` on Render must be at least 32 bytes or the container will refuse to start (see `auth.MinSecretLen`).
 
@@ -30,7 +30,7 @@ This is a resume-artifact MVP with a hard deadline (Thursday Sept 10, 2026, 11:0
 - `make dev` — run the api on the host; `make run` (phase 5) will be `docker compose up --build`
 - `make test` — unit only
 - `make test-integration` — unit + integration (build tag `integration`; **requires `DATABASE_URL`** and fails loudly without it)
-- `make lint` — `go vet ./...` plus staticcheck (pinned v0.8.1; older releases cannot decode Go 1.25+ export data)
+- `make lint` — `go vet` plus staticcheck (pinned v0.8.1; older releases cannot decode Go 1.25+ export data). Both run with `-tags=integration`, or neither would read a single DB-backed test file
 - `make docker-build` — production image, prints its size
 - `make seed-admin` — phase 4; idempotent admin from `ADMIN_EMAIL` / `ADMIN_PASSWORD`
 
@@ -57,6 +57,11 @@ Three invariants there that are easy to undo by accident, each pinned by a test 
 **Search** — `applications.search_vec` is a *generated stored* tsvector column over role_title/location/notes with a GIN index. Note the two-argument `to_tsvector('english', ...)`: the one-argument form is only STABLE and a generated column requires IMMUTABLE.
 
 `?q=` is a **UNION of two ranked branches**, not one OR'd predicate (PRD §Endpoints): the tsvector branch ranked by `ts_rank`, and a `companies.name ilike` branch at a fixed rank of 1.0, `union all`-ed and deduplicated by `max(rank)` per id. Splitting them is what keeps the tsvector predicate index-eligible — OR-ing an unindexed `ilike` into the same `where` defeats the GIN index, and `EXPLAIN` must still show a Bitmap Index Scan on `applications_search_idx`.
+
+Two planner facts that integration test 12 depends on, both measured rather than assumed, and both worth being able to explain:
+
+- **A GIN index must be vacuumed before its cost looks right.** New entries sit in a pending list until vacuum merges them, and the planner prices a scan over an unmerged list at what reading the list would cost. Same index, same rows: cost **127.56 before `VACUUM`, 12.84 after** — the difference between the planner rejecting `applications_search_idx` and choosing it. `ANALYZE` does not flush it. Any test or benchmark that bulk-inserts and then reasons about a plan has to `vacuum` first.
+- **`applications_user_idx` competes with the GIN index on the owner-scoped query**, and which wins turns on term selectivity, not table size. On 2000 rows owned by one user, a term matching 1 row in 10 plans as an Index Scan on `applications_user_idx` with the tsvector predicate as a `Filter`; 1 row in 500 plans as a Bitmap Index Scan on `applications_search_idx`. Both are correct — a term matching a tenth of the table is not what a GIN index is for. Don't "fix" the first case.
 
 **Companies** are a separate normalized table; `POST /applications` upserts by name (`on conflict (name) do update ... returning id`) rather than storing a company string per row.
 

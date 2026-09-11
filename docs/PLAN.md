@@ -155,7 +155,7 @@ The bulk of the work. Everything before this was foundations.
 | `internal/httpx/requestid.go` | `EchoRequestID` — copies chi's request id into an `X-Request-Id` **header**. Not into the body: the PRD fixes the error shape as `{"error": "..."}`. |
 | `Makefile` | Complete: add `run`, `seed-admin`. |
 | Unit tests | `internal/applications/{search,model}_test.go`, `internal/users/users_test.go`, `internal/server/router_test.go`. All DB-free. |
-| `test/integration/api_test.go` + `helpers_test.go` | Build tag `integration`. |
+| `test/integration/api_test.go` + `helpers_test.go` | Build tag `integration`. One `httptest.Server` over `server.New` for the package; `truncate ... restart identity cascade` at the **start** of each test rather than in `t.Cleanup`, so a failure leaves its rows to look at and the next test still starts from nothing. |
 
 Reuse chi's own `middleware.RequestID` and `middleware.Recoverer` rather than writing them; `httpx` only needs a helper to echo the request id back.
 
@@ -187,9 +187,19 @@ Ownership: non-admins get `user_id = $n` appended to the list query; single-item
 
 Test 12 turns a manual DoD checkbox into something CI enforces. `enable_seqscan = off` is needed because on a ten-row table the planner will rightly prefer a sequential scan; the test proves the index is *usable*, which is the actual claim.
 
+**Two things had to be true before that test would pass, and neither was obvious.**
+
+*The GIN pending list.* A GIN index buffers new entries in a pending list and merges them into the tree only on vacuum (or when the list fills). The planner prices a scan over an unmerged list at the cost of reading the list, so immediately after a bulk insert the same index over the same rows looks an order of magnitude more expensive than it is — measured here, cost **127.56 before `VACUUM` and 12.84 after**, which is exactly the difference between the planner rejecting `applications_search_idx` and choosing it. `ANALYZE` alone does not flush it. The seed therefore runs `vacuum analyze`, without which the test passes or fails depending on whether autovacuum happened to run.
+
+*Selectivity, not table size.* `applications_user_idx` competes with the GIN index on the owner-scoped query: Postgres weighs a GIN scan against a plain btree scan of the user index with the tsvector predicate applied as a `Filter`. On 2000 rows owned by one user, a term matching 1 row in 10 plans as an Index Scan on `applications_user_idx`; a term matching 1 row in 500 plans as a Bitmap Index Scan on `applications_search_idx`. **Both are the planner being right** — a term matching a tenth of the table is not what a GIN index is for — so the corpus uses a distinctive term, which is the case the index exists to serve. Test 12 asserts the plan for both shapes of the shipped query, owner-scoped and admin.
+
 **Verify:** `make test-integration`
 
 **Done when:** all 12 pass in under 60s, and the README's three curl commands (register → login → create) work against `go run ./cmd/api`.
+
+**Done.** All 12 scenarios pass, 56 cases in total, `make test-integration` in **9.3s** against local Postgres — comfortably inside the 60s CI budget. Four mutations confirmed the suite has teeth: the tsvector predicate recomputed inline instead of reading the stored column (test 12 fails, both shapes), `readScope` always returning nil so reads ignore ownership (tests 5 and 8 fail), `escapeLike` neutered (test 8 fails), and the company branch's fixed rank dropped from 1.0 to 0.0 (test 8's ranking assertion fails).
+
+`make lint` now passes `-tags=integration` to both `go vet` and staticcheck. Without it neither tool reads a file behind that build tag — which is every DB-backed test in the repo, and since this phase that is the largest body of test code in it.
 
 **Checkpoint (handlers + router).** Everything except `test/integration` is built and green: `make test` passes all seven packages, `make lint` is clean. `router_test.go` proves the wiring with no database — it builds the real router over a nil pool and asserts every one of the eight protected routes answers 401 **with `WWW-Authenticate: Bearer`**. The header matters: each handler *also* refuses a request with no principal, so status alone would still read 401 for a route mounted outside the auth group. Four mutations confirmed the teeth: a route moved out of the group, the admin group gated on `user` instead of `admin`, `EchoRequestID` dropped, and the JSON 405 handler dropped.
 
