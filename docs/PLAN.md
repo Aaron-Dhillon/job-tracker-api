@@ -201,6 +201,10 @@ Test 12 turns a manual DoD checkbox into something CI enforces. `enable_seqscan 
 
 `make lint` now passes `-tags=integration` to both `go vet` and staticcheck. Without it neither tool reads a file behind that build tag — which is every DB-backed test in the repo, and since this phase that is the largest body of test code in it.
 
+**Amended during Phase 5.** Both integration suites opened by dropping the public schema of the database `DATABASE_URL` names — which is the developer's own, and the reason a `make test-integration` run took the dev data with it every time. They now run against a `jobtracker_test` sibling instead, provisioned by a new `internal/dbtest` package (second addition to the PRD's repo layout, after `internal/server`; Go has no way to share a test helper across two packages without one).
+
+`dbtest.URL` derives the sibling from `DATABASE_URL` by swapping only the database name — host, port, credentials and `sslmode` carry over, so pointing at a non-default server still works — and creates it from a connection to the database `DATABASE_URL` already names, which is known to exist, rather than assuming a `postgres` maintenance database. `dbtest.Reset` is the one that runs `drop schema public cascade`, and it opens its own connection to check `current_database()` first, so the name guard cannot be bypassed by handing it a pool built elsewhere. Proven both ways: the dev database still held its five users and its manual-curl rows after a full run, and deleting the guard makes `TestReset_RefusesAnyOtherDatabase` fail (checked against a throwaway database, not the dev one).
+
 **Checkpoint (handlers + router).** Everything except `test/integration` is built and green: `make test` passes all seven packages, `make lint` is clean. `router_test.go` proves the wiring with no database — it builds the real router over a nil pool and asserts every one of the eight protected routes answers 401 **with `WWW-Authenticate: Bearer`**. The header matters: each handler *also* refuses a request with no principal, so status alone would still read 401 for a route mounted outside the auth group. Four mutations confirmed the teeth: a route moved out of the group, the admin group gated on `user` instead of `admin`, `EchoRequestID` dropped, and the JSON 405 handler dropped.
 
 ---
@@ -219,6 +223,15 @@ Test 12 turns a manual DoD checkbox into something CI enforces. `enable_seqscan 
 **Verify:** `make run`
 
 **Done when:** `curl -s localhost:8080/healthz` returns ok against the *containerised* API; `docker images job-tracker-api --format '{{.Size}}'` is **< 30 MB**; and the full curl chain (register → login → create → transition → `?q=` search) works against the container.
+
+**Done.** `docker compose up --build` reports `postgres ... Healthy` and only then starts `api`, which applies migrations and listens. `curl localhost:8080/healthz` returns `{"status":"ok"}` against the container, the image is **21.8 MB**, and the full chain passes against it: register → login → create → transition → history → `?q=kubernetes` (tsvector branch) → `?q=Compose` (company branch) → delete → 404.
+
+Two departures from the plan, both about `.env` being the only place the non-default values live:
+
+- `env_file` is `{path: .env, required: false}`, not a bare `.env`. A bare one makes `docker compose config` fail outright in a fresh clone, which takes `make db-up` down with it — a target that has nothing to do with the api service. Optional, the api container starts and exits on `jwt secret must be at least 32 bytes`, which is the message that actually tells you to run `cp .env.example .env`.
+- `PORT: 8080` is pinned on the service next to `DATABASE_URL`. The published port is written in the compose file; letting `.env` move the container's listener out from under it is how `make run` comes to serve nothing on 8080.
+
+`make dev` and `make seed-admin` now source `.env` themselves (`set -a; [ -f .env ] && . ./.env; set +a`), so neither needs three variables exported by hand — `make dev` previously died on an empty `JWT_SECRET` unless you had exported it. The file wins over the Makefile's `DATABASE_URL ?=` default for those two targets, which is the point: `.env` is where a URL that is not localhost gets written down.
 
 ---
 
@@ -254,6 +267,22 @@ No separate migrate step is needed — the test harness calls `db.Up`. (The PRD 
 **Verify:** open a PR → CI green; merge → deploy fires → `curl https://<service>.onrender.com/healthz`
 
 **Done when:** every box in PRD §Definition of done is ticked.
+
+**Built; the deploy leg is not yet exercised** — `ci-cd` has not been pushed, so nothing has run on GitHub. Locally both workflows parse, `actionlint` is clean, and `ci.yml`'s `name: CI` was checked against `deploy.yml`'s `workflows: ["CI"]` mechanically rather than by eye.
+
+Three corrections to this phase as planned:
+
+- **`make lint` would have failed in CI.** staticcheck v0.8.1's own module declares `go 1.26.0`, above go.mod's 1.25.11 floor — and `setup-go` with `go-version-file: go.mod` installs exactly that floor. Under the repo-wide `GOTOOLCHAIN=local` pin the step dies with `honnef.co/go/tools@v0.8.1 requires go >= 1.26.0`. Reproduced locally with `GOTOOLCHAIN=go1.25.11` rather than assumed, then fixed by scoping `GOTOOLCHAIN=auto` to the staticcheck command alone: the pin exists so the api binary matches what the Docker builder produces, and a linter is not part of that binary. It also means `make lint` now works on a machine running exactly the Go go.mod asks for, which it did not before.
+- **CI runs `make lint` and `make test-integration`, not an open-coded `go vet` plus a staticcheck action.** Steps 4 and 5 as written would have dropped `-tags=integration`, so CI would have linted none of the DB-backed tests — the largest body of test code in the repo — while reporting green.
+- **`JWT_SECRET=test-secret` is dropped, not lengthened.** It is 11 bytes and `auth.NewIssuer` rejects anything under 32, so the planned value would have been refused had anything read it. Nothing does: the integration harness carries its own 40-byte secret and no unit test reads the variable.
+
+`deploy.yml` passes the hook URL through `env:` instead of interpolating `${{ secrets... }}` into the `run:` line, so the credential never becomes part of a shell command, and declares `permissions: {}` — the job makes one outbound request and needs no repository access at all.
+
+Outstanding before the first real deploy:
+
+- [ ] **Rotate `JWT_SECRET` on Render to at least 32 bytes.** The value from the Phase-1 dry run predates `auth.MinSecretLen`; a Phase-4 container with a short secret refuses to start and Render rolls back to the `/healthz` skeleton.
+- [ ] GitHub repo secret `RENDER_DEPLOY_HOOK_URL`
+- [ ] Push `ci-cd`, open the PR, confirm CI green, merge. That merge lands `deploy.yml` on the default branch **without** triggering it — the next one is the first real deploy.
 
 ---
 

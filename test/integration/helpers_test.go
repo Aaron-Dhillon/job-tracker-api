@@ -11,7 +11,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +27,7 @@ import (
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/applications"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/auth"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/db"
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/dbtest"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/server"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/users"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/workflow"
@@ -56,26 +56,17 @@ func TestMain(m *testing.M) {
 // package. One server and one pool, because the cost worth avoiding is the
 // per-test connection setup, not the truncate.
 func runTests(m *testing.M) (int, error) {
-	// Fail rather than skip. The `integration` build tag is an explicit
-	// opt-in, so a missing DATABASE_URL means a misconfigured run, not an
-	// irrelevant one -- and skipping would let CI report green having tested
-	// nothing at all.
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
-		return 0, errors.New("DATABASE_URL is required; run `make db-up` first")
-	}
-
 	ctx := context.Background()
 
-	// Dropping the schema also clears schema_migrations, so the run starts
-	// from nothing whatever the last one left behind.
-	admin, err := pgxpool.New(ctx, url)
+	// Deliberately not the database DATABASE_URL names. This suite drops the
+	// public schema, so it runs against a sibling database it owns outright --
+	// otherwise a test run silently deletes whatever the developer who started
+	// it was working on.
+	url, err := dbtest.URL(ctx)
 	if err != nil {
 		return 0, err
 	}
-	_, err = admin.Exec(ctx, "drop schema public cascade; create schema public;")
-	admin.Close()
-	if err != nil {
+	if err := dbtest.Reset(ctx, url); err != nil {
 		return 0, err
 	}
 	if err := db.Up(url); err != nil {

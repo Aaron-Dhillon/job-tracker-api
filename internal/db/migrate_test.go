@@ -5,7 +5,6 @@ package db_test
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -14,29 +13,25 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/db"
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/dbtest"
 )
 
 // freshDB drops and recreates the public schema, then migrates up. Dropping the
-// schema also clears schema_migrations, so every test starts from nothing.
+// schema also clears schema_migrations, so every test starts from nothing --
+// including after a migration file changes, which is the case that a skipped
+// "already applied" version would quietly break.
+//
+// The database is dbtest's, never the one DATABASE_URL names: a helper whose
+// first act is `drop schema public cascade` must not be pointed at whatever
+// the developer running the tests was working on.
 func freshDB(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 
-	// Fail rather than skip: the `integration` build tag is an explicit opt-in,
-	// so a missing DATABASE_URL means a misconfigured run, not an irrelevant
-	// one. Skipping here would let CI report green having tested nothing.
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
-		t.Fatal("DATABASE_URL is required for integration tests; run `make db-up` first")
-	}
-
 	ctx := context.Background()
 
-	admin, err := pgxpool.New(ctx, url)
+	url, err := dbtest.URL(ctx)
 	require.NoError(t, err)
-	_, err = admin.Exec(ctx, "drop schema public cascade; create schema public;")
-	admin.Close()
-	require.NoError(t, err)
-
+	require.NoError(t, dbtest.Reset(ctx, url))
 	require.NoError(t, db.Up(url))
 
 	pool, err := db.New(ctx, url)

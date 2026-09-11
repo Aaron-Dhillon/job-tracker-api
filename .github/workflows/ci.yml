@@ -1,0 +1,60 @@
+# The name is load bearing: deploy.yml keys its workflow_run trigger off this
+# exact string, and a rename here silently stops deploys.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint and test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jobtracker
+        ports:
+          - 5432:5432
+        # Actions holds the job's first step until this passes, which is what
+        # replaces the wait loop `make db-up` needs locally. Without it the
+        # migrations race Postgres's own initdb and fail on a refused
+        # connection roughly one run in three.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # The suites do not use this database: they derive a jobtracker_test
+      # sibling from it and create it on the fly (internal/dbtest), because
+      # their first act is to drop the public schema.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/jobtracker?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod is the only place the version is written down. Restating it
+          # here is how CI ends up testing a Go the Docker builder never runs.
+          go-version-file: go.mod
+          cache: true
+
+      # Both targets are the ones a developer runs locally, not a re-spelling
+      # of them -- including the -tags=integration that makes vet and
+      # staticcheck read the DB-backed tests at all.
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test-integration
