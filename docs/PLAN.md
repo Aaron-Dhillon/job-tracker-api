@@ -142,19 +142,24 @@ The bulk of the work. Everything before this was foundations.
 | File | Contents |
 |---|---|
 | `internal/users/model.go` | `User` (never serialise `password_hash`). |
-| `internal/users/repo.go` | `Create` (pg error `23505` → `ErrEmailTaken`), `GetByEmail`, `GetByID`, `List`. |
+| `internal/users/validate.go` | `NormalizeEmail` (lowercase + trim), `ValidateCredentials`. `mail.ParseAddress` also accepts `"A" <a@b.c>`, so the parsed `addr.Address` is compared back against the input to reject display-name form. |
+| `internal/users/repo.go` | `Create` (pg error `23505` → `ErrEmailTaken`), `Upsert`, `GetByEmail`, `GetByID`, `List`. |
 | `internal/users/admin.go` | `EnsureAdmin(ctx, repo, email, pw)` — idempotent upsert, forces `role='admin'`, refreshes the hash so a rotated `ADMIN_PASSWORD` takes effect. **One implementation, two callers** (startup + `make seed-admin`). |
 | `internal/users/handlers.go` | `Register`, `Login`, `AdminListUsers`. |
-| `internal/applications/model.go` | `Application`, `Transition`, `CreateInput`, `PatchInput` (nullable fields as `*string`). |
+| `internal/applications/model.go` | `Application`, `Transition`, `CreateInput`, `PatchInput`, and `Date` (a `time.Time` that marshals as `YYYY-MM-DD` and rejects anything else). `PatchInput` uses a generic `Optional[T]{Set bool; Value *T}` — see the locked decision below. |
 | `internal/applications/repo.go` | `Create` (tx: company upsert → insert), `Get`, `List`, `Update`, `Delete`, `Transition` (tx), `History`. |
-| `internal/applications/search.go` | Dynamic WHERE builder — see the index note below. |
+| `internal/applications/search.go` | `ParseListParams` + `BuildListQuery`. Exported so integration test 12 can `EXPLAIN` the *real* query rather than a copy. |
 | `internal/applications/handlers.go` | All seven `/applications` routes. The transition handler maps `workflow.ErrUnknownState` → 400 and `workflow.ErrInvalidTransition` → 409, and the 409 body carries `from` plus `workflow.Next(from)` as `allowed` (PRD §Endpoints). |
 | `internal/server/router.go` | **New file, not in the PRD layout.** `New(deps) http.Handler` — chi router, all routes, middleware stack. Exists so integration tests build the *same* router `main.go` serves; `package main` can't be imported, and duplicated wiring drifts. |
-| `cmd/api/main.go` | Full wiring: env → pool → migrate → `EnsureAdmin` if env set → `server.New` → `ListenAndServe` with graceful shutdown. |
-| `Makefile` | Complete: add `run`, `build`, `seed-admin`. |
+| `cmd/api/main.go` | Full wiring: env → migrate → `NewIssuer` → pool → `EnsureAdmin` if env set → `server.New` → serve with SIGTERM drain. The issuer is built **before** the pool so a short `JWT_SECRET` fails at startup, not at the first login. |
+| `internal/httpx/requestid.go` | `EchoRequestID` — copies chi's request id into an `X-Request-Id` **header**. Not into the body: the PRD fixes the error shape as `{"error": "..."}`. |
+| `Makefile` | Complete: add `run`, `seed-admin`. |
+| Unit tests | `internal/applications/{search,model}_test.go`, `internal/users/users_test.go`, `internal/server/router_test.go`. All DB-free. |
 | `test/integration/api_test.go` + `helpers_test.go` | Build tag `integration`. |
 
-Reuse chi's own `middleware.RequestID`, `middleware.RealIP`, `middleware.Recoverer` rather than writing them; `httpx` only needs a helper to echo the request id into error responses.
+Reuse chi's own `middleware.RequestID` and `middleware.Recoverer` rather than writing them; `httpx` only needs a helper to echo the request id back.
+
+**`middleware.RealIP` is deliberately left out.** It rewrites `RemoteAddr` from a client-supplied `X-Forwarded-For`, which anyone can forge, and nothing here keys off the client address — rate limiting is out of scope. Adding it would mean trusting a spoofable header for no gain.
 
 **Two implementation details that decide whether the DoD passes:**
 
@@ -185,6 +190,8 @@ Test 12 turns a manual DoD checkbox into something CI enforces. `enable_seqscan 
 **Verify:** `make test-integration`
 
 **Done when:** all 12 pass in under 60s, and the README's three curl commands (register → login → create) work against `go run ./cmd/api`.
+
+**Checkpoint (handlers + router).** Everything except `test/integration` is built and green: `make test` passes all seven packages, `make lint` is clean. `router_test.go` proves the wiring with no database — it builds the real router over a nil pool and asserts every one of the eight protected routes answers 401 **with `WWW-Authenticate: Bearer`**. The header matters: each handler *also* refuses a request with no principal, so status alone would still read 401 for a route mounted outside the auth group. Four mutations confirmed the teeth: a route moved out of the group, the admin group gated on `user` instead of `admin`, `EchoRequestID` dropped, and the JSON 405 handler dropped.
 
 ---
 
@@ -257,6 +264,10 @@ No separate migrate step is needed — the test harness calls `db.Up`. (The PRD 
 | `JWT_SECRET` length | **Minimum 32 bytes**, enforced at `NewIssuer` (RFC 7518 §3.2). Rotate the Render value before Phase 4 |
 | UUID handling | `github.com/google/uuid` for `Principal.ID` and the `sub` claim. Not named in PRD §Stack, but it is a parse-and-validate step, not a substitute for anything listed — a malformed `sub` is rejected at `Verify` instead of reaching SQL |
 | Oversized request body | **413**, not 400 — the body is well-formed, just over the 1 MB cap |
+| PATCH absent vs. explicit null | A generic `Optional[T]{Set bool; Value *T}` rather than `*string`. `*string` cannot tell `{}` from `{"notes": null}` — both arrive as nil — and the PRD wants one to leave the column alone and the other to clear it |
+| `?q=` company match | `escapeLike` escapes `\`, `%` and `_` before wrapping the term in `%...%`. **Deviates from the PRD's literal `'%' || $1 || '%'`**, under which a search for `100%` matches every company on file |
+| Malformed uuid in a path | **404**, not 400. `/applications/garbage` is a URL that identifies nothing; 400 would be a second way to distinguish shapes of non-existent id, and 404 keeps every single-item route answering one thing |
+| `middleware.RealIP` | **Omitted.** Spoofable via `X-Forwarded-For` and nothing keys off the client address |
 
 ### Internal conflicts in the PRD
 
@@ -277,7 +288,7 @@ No separate migrate step is needed — the test harness calls `db.Up`. (The PRD 
 | # | Question the PRD doesn't answer | Default |
 |---|---|---|
 | 1 | `applied_on` wire format | `"YYYY-MM-DD"` string in and out, not RFC3339 timestamps |
-| 2 | PATCH: absent field vs. explicit null | `*string` pointers — absent leaves the column alone, explicit `null` clears `location`/`notes` |
+| 2 | PATCH: absent field vs. explicit null | `Optional[T]` — absent leaves the column alone, explicit `null` clears `location`/`notes`. See the locked decision above for why `*string` can't do it |
 | 3 | PATCH with `status` in the body | **400**, not silent ignore. Transitions have their own endpoint for a reason |
 | 4 | Non-owner on PATCH/DELETE/transition | 404, same as GET. Uniform, and never confirms existence |
 | 5 | Ownership on `GET /{id}/history` | Same rule as `GET /{id}` |

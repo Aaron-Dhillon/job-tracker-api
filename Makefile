@@ -12,7 +12,7 @@ export DATABASE_URL
 STATICCHECK := honnef.co/go/tools/cmd/staticcheck@v0.8.1
 IMAGE := job-tracker-api
 
-.PHONY: help tidy fmt vet lint build dev migrate db-up db-down db-reset psql test test-integration docker-build
+.PHONY: help tidy fmt vet lint build run dev migrate seed-admin db-up db-down db-reset psql test test-integration docker-build
 
 help:
 	@echo "db-up            start postgres and wait for it to accept connections"
@@ -20,6 +20,8 @@ help:
 	@echo "db-reset         stop postgres and delete the volume"
 	@echo "migrate          apply migrations against DATABASE_URL"
 	@echo "dev              run the api on the host"
+	@echo "run              build and start api + postgres in docker compose"
+	@echo "seed-admin       upsert the admin from ADMIN_EMAIL/ADMIN_PASSWORD"
 	@echo "test             unit tests"
 	@echo "test-integration unit + integration tests (needs db-up)"
 	@echo "lint             go vet + staticcheck"
@@ -44,6 +46,12 @@ build:
 
 dev:
 	go run ./cmd/api
+
+run:
+	docker compose up --build
+
+seed-admin:
+	go run ./cmd/api -seed-admin
 
 migrate:
 	go run ./cmd/api -migrate-only

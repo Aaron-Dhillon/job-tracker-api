@@ -11,7 +11,9 @@ every phase and show the output.
 
 ## Current state
 
-Phases 1-3 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, `internal/workflow`, and `internal/auth` + `internal/httpx`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase. Phases 4-6 are not started.
+Phases 1-3 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, `internal/workflow`, and `internal/auth` + `internal/httpx`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase.
+
+Phase 4 is built apart from the integration suite: `internal/users`, `internal/applications`, `internal/server/router.go`, the full `cmd/api/main.go`, and DB-free unit tests for search SQL, the JSON date and `Optional[T]`, user validation, and router wiring. `test/integration` is the remaining piece. Phases 5-6 are not started.
 
 **Before Phase 4 deploys:** `JWT_SECRET` on Render must be at least 32 bytes or the container will refuse to start (see `auth.MinSecretLen`).
 
@@ -50,13 +52,15 @@ Three invariants there that are easy to undo by accident, each pinned by a test 
 - `NewIssuer` rejects a `JWT_SECRET` under 32 bytes (RFC 7518 §3.2). HS256 is only as strong as its key.
 - Every auth failure is one identical 401 body, and `auth.DummyCheck` keeps unknown-email login *timing* identical too. Do not add a more helpful message.
 
-`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding and the `{"error": "..."}` response shape (request-id echo lands in phase 4 with the router). `httpx.Decode` caps bodies at 1 MB, rejects unknown fields and trailing content, and returns a `*httpx.Error` carrying the status — so handlers call `httpx.WriteDecodeError(w, err)` and an oversized body is a 413 rather than a blanket 400. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
+`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding, the `{"error": "..."}` response shape, and `EchoRequestID`, which returns chi's request id in an `X-Request-Id` **header** — not in the body, because the PRD fixes the error shape. `httpx.Decode` caps bodies at 1 MB, rejects unknown fields and trailing content, and returns a `*httpx.Error` carrying the status — so handlers call `httpx.WriteDecodeError(w, err)` and an oversized body is a 413 rather than a blanket 400. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
 
 **Search** — `applications.search_vec` is a *generated stored* tsvector column over role_title/location/notes with a GIN index. Note the two-argument `to_tsvector('english', ...)`: the one-argument form is only STABLE and a generated column requires IMMUTABLE.
 
 `?q=` is a **UNION of two ranked branches**, not one OR'd predicate (PRD §Endpoints): the tsvector branch ranked by `ts_rank`, and a `companies.name ilike` branch at a fixed rank of 1.0, `union all`-ed and deduplicated by `max(rank)` per id. Splitting them is what keeps the tsvector predicate index-eligible — OR-ing an unindexed `ilike` into the same `where` defeats the GIN index, and `EXPLAIN` must still show a Bitmap Index Scan on `applications_search_idx`.
 
 **Companies** are a separate normalized table; `POST /applications` upserts by name (`on conflict (name) do update ... returning id`) rather than storing a company string per row.
+
+**Routing** lives in `internal/server/router.go`, not `main.go`, because `package main` can't be imported and a test that rewires its own routes stops testing the ones that ship. Every authenticated route sits inside one `r.Group`, so the default for a new route added in that block is "protected" rather than "public". `middleware.RealIP` is deliberately absent — it trusts a spoofable `X-Forwarded-For` and nothing here keys off the client address. `router_test.go` builds the real router over a nil pool and asserts each protected route 401s **with `WWW-Authenticate: Bearer`**; handlers also refuse a request with no principal, so without that header check a route mounted outside the group would still look like a pass.
 
 ## CI/CD
 
