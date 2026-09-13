@@ -21,24 +21,25 @@ import (
 // including after a migration file changes, which is the case that a skipped
 // "already applied" version would quietly break.
 //
-// The database is dbtest's, never the one DATABASE_URL names: a helper whose
-// first act is `drop schema public cascade` must not be pointed at whatever
-// the developer running the tests was working on.
+// The database is this suite's own, never the one DATABASE_URL names and never
+// one another suite is using: a helper whose first act is `drop schema public
+// cascade` runs four times here while test/integration is mid-run in a parallel
+// test binary.
 func freshDB(t *testing.T) (string, *pgxpool.Pool) {
 	t.Helper()
 
 	ctx := context.Background()
 
-	url, err := dbtest.URL(ctx)
+	tdb, err := dbtest.Open(ctx, dbtest.SuiteMigrations)
 	require.NoError(t, err)
-	require.NoError(t, dbtest.Reset(ctx, url))
-	require.NoError(t, db.Up(url))
+	require.NoError(t, tdb.Reset(ctx))
+	require.NoError(t, db.Up(tdb.URL))
 
-	pool, err := db.New(ctx, url)
+	pool, err := db.New(ctx, tdb.URL)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	return url, pool
+	return tdb.URL, pool
 }
 
 func sqlState(err error) string {
