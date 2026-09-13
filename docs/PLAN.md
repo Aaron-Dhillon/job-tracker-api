@@ -201,7 +201,7 @@ Test 12 turns a manual DoD checkbox into something CI enforces. `enable_seqscan 
 
 `make lint` now passes `-tags=integration` to both `go vet` and staticcheck. Without it neither tool reads a file behind that build tag — which is every DB-backed test in the repo, and since this phase that is the largest body of test code in it.
 
-**Amended during Phase 5.** Both integration suites opened by dropping the public schema of the database `DATABASE_URL` names — which is the developer's own, and the reason a `make test-integration` run took the dev data with it every time. They now run against a `jobtracker_test` sibling instead, provisioned by a new `internal/dbtest` package (second addition to the PRD's repo layout, after `internal/server`; Go has no way to share a test helper across two packages without one).
+**Amended during Phase 5.** Both integration suites opened by dropping the public schema of the database `DATABASE_URL` names — which is the developer's own, and the reason a `make test-integration` run took the dev data with it every time. They now run against a sibling provisioned by a new `internal/dbtest` package (second addition to the PRD's repo layout, after `internal/server`; Go has no way to share a test helper across two packages without one). *Amended again after the first merge — see the flake note at the end of Phase 6; the sibling is per-suite, `jobtracker_test_<suite>`.*
 
 `dbtest.URL` derives the sibling from `DATABASE_URL` by swapping only the database name — host, port, credentials and `sslmode` carry over, so pointing at a non-default server still works — and creates it from a connection to the database `DATABASE_URL` already names, which is known to exist, rather than assuming a `postgres` maintenance database. `dbtest.Reset` is the one that runs `drop schema public cascade`, and it opens its own connection to check `current_database()` first, so the name guard cannot be bypassed by handing it a pool built elsewhere. Proven both ways: the dev database still held its five users and its manual-curl rows after a full run, and deleting the guard makes `TestReset_RefusesAnyOtherDatabase` fail (checked against a throwaway database, not the dev one).
 
@@ -283,6 +283,28 @@ Outstanding before the first real deploy:
 - [ ] **Rotate `JWT_SECRET` on Render to at least 32 bytes.** The value from the Phase-1 dry run predates `auth.MinSecretLen`; a Phase-4 container with a short secret refuses to start and Render rolls back to the `/healthz` skeleton.
 - [ ] GitHub repo secret `RENDER_DEPLOY_HOOK_URL`
 - [ ] Push `ci-cd`, open the PR, confirm CI green, merge. That merge lands `deploy.yml` on the default branch **without** triggering it — the next one is the first real deploy.
+
+### The first CI flake, and what it was really about
+
+CI went green on the PR and red on the identical squash commit on `main`, failing `internal/db` with:
+
+```
+create database jobtracker_test: ERROR: duplicate key value violates unique constraint
+"pg_database_datname_index" (SQLSTATE 23505)
+```
+
+`CREATE DATABASE` checks the name and inserts into `pg_database` without holding anything between the two steps. `go test ./...` runs one binary per package in parallel, so on a runner where the database does not exist yet, three packages call it at the same instant, all pass the check, and the losers get a **unique violation (23505)** — not the `duplicate_database` (**42P04**) that `create` was written to treat as benign. It is a first-run-only race, which is exactly why it never showed locally: the database has existed on this machine since the day it was written, and every call since has taken the 42P04 path.
+
+Confirmed rather than reasoned about, at two levels: four concurrent `psql -c "create database jobtracker_test"` against a server without it produce three 23505s and one success, while the same four against a server *with* it produce four clean 42P04s; and eight goroutines calling the old `dbtest.URL` reproduce CI's error message verbatim. Five clean `make test-integration` runs from a dropped database did *not* reproduce it — `go test` staggers package binaries enough on this machine to hide it, which is the whole character of the bug.
+
+Two fixes, because the race was only the half of it that had fired yet:
+
+- **Creation holds an advisory lock** across the existence check and the create, so at most one caller is ever between those two steps. That removes the race by construction rather than by widening the list of error codes to forgive — 23505 means "it exists now" here, but it is the wrong thing to reason from, and a caller that special-cases it is one CREATE DATABASE implementation detail away from being wrong again.
+- **Each suite gets its own database**, `jobtracker_test_<suite>`. The suites were sharing one, and `internal/db`'s `freshDB` drops the public schema *four times* while `test/integration` is eleven seconds into a run in a parallel binary. That had not failed yet; it was a coin flip on every run, and on the green PR run it landed heads. Fixing only the creation race would have left it.
+
+`dbtest.URL` became `dbtest.Open(ctx, suite) (*DB, error)` with `(*DB).Reset`. The suite is recorded by `Open` and unexported, so a caller cannot construct a `DB` naming the developer's database and have `Reset` agree to drop it — the guard moved from a runtime check to something the type system carries, with the runtime check kept underneath it.
+
+**Verified:** eight consecutive `make test-integration` runs, every suite database dropped before each, all green in ~9.2s. `TestOpen_IsSafeWhenSuitesStartTogether` is the regression test; deleting the advisory lock makes it fail with CI's exact message.
 
 ---
 

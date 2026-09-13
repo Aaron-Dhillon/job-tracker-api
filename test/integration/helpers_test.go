@@ -58,22 +58,23 @@ func TestMain(m *testing.M) {
 func runTests(m *testing.M) (int, error) {
 	ctx := context.Background()
 
-	// Deliberately not the database DATABASE_URL names. This suite drops the
-	// public schema, so it runs against a sibling database it owns outright --
-	// otherwise a test run silently deletes whatever the developer who started
-	// it was working on.
-	url, err := dbtest.URL(ctx)
+	// Deliberately not the database DATABASE_URL names, and deliberately not
+	// one any other suite uses. This suite drops the public schema, so it runs
+	// against a database it owns outright -- otherwise a run deletes whatever
+	// the developer who started it was working on, or races the internal/db
+	// suite that `go test ./...` is running in parallel with it.
+	tdb, err := dbtest.Open(ctx, dbtest.SuiteAPI)
 	if err != nil {
 		return 0, err
 	}
-	if err := dbtest.Reset(ctx, url); err != nil {
+	if err := tdb.Reset(ctx); err != nil {
 		return 0, err
 	}
-	if err := db.Up(url); err != nil {
+	if err := db.Up(tdb.URL); err != nil {
 		return 0, err
 	}
 
-	pool, err = db.New(ctx, url)
+	pool, err = db.New(ctx, tdb.URL)
 	if err != nil {
 		return 0, err
 	}

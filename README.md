@@ -108,10 +108,12 @@ pass the check.
 - **Migrations are embedded** (`go:embed` + golang-migrate's `iofs`), so the
   distroless image ships them and a container start is self-contained. That is
   what makes a Render deploy work with no migration step.
-- **The integration suite owns its own database.** It drops and recreates the
-  public schema, so it derives a `jobtracker_test` sibling from `DATABASE_URL`
-  and creates it on the fly (`internal/dbtest`), and refuses to reset anything
-  else. A test run never touches the database you were working in.
+- **Each integration suite owns its own database.** They drop and recreate the
+  public schema, so every one derives a `jobtracker_test_<suite>` sibling from
+  `DATABASE_URL` and creates it on the fly (`internal/dbtest`), and refuses to
+  reset anything else. A test run never touches the database you were working
+  in — and because `go test ./...` runs package binaries in parallel, never
+  drops a schema another suite is mid-run against either.
 
 ## Development
 

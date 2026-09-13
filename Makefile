@@ -35,7 +35,7 @@ help:
 	@echo "run              build and start api + postgres in docker compose"
 	@echo "seed-admin       upsert the admin from ADMIN_EMAIL/ADMIN_PASSWORD in .env"
 	@echo "test             unit tests"
-	@echo "test-integration unit + integration tests (needs db-up; uses jobtracker_test)"
+	@echo "test-integration unit + integration tests (needs db-up; uses jobtracker_test_*)"
 	@echo "lint             go vet + staticcheck"
 	@echo "build            build ./bin/api"
 	@echo "docker-build     build the production image"
