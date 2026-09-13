@@ -11,9 +11,11 @@ every phase and show the output.
 
 ## Current state
 
-Phases 1-3 are done: module, migrations, `internal/db`, `/healthz`, Makefile, Dockerfile, postgres-only Compose, `internal/workflow`, and `internal/auth` + `internal/httpx`. Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase. Phases 4-6 are not started.
+All six phases are built. Phases 1-5 are verified end to end. Phase 6's two workflows and the README exist and lint clean, but nothing has run on GitHub: the work sits on the unpushed branch `ci-cd`.
 
-**Before Phase 4 deploys:** `JWT_SECRET` on Render must be at least 32 bytes or the container will refuse to start (see `auth.MinSecretLen`).
+Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase — though that deployment is still the Phase-1 `/healthz` skeleton.
+
+**Before the first Phase-4+ deploy:** `JWT_SECRET` on Render must be at least 32 bytes or the container refuses to start (see `auth.MinSecretLen`), and the repo needs a `RENDER_DEPLOY_HOOK_URL` secret. Mind the `workflow_run` rule too: the merge that lands `deploy.yml` on `main` does not trigger it — the next one does.
 
 `docs/PRD.md` is the authoritative spec. `docs/PLAN.md` is the six-phase build order derived from it — it records which files each phase adds, the tests that prove it, and every place the PRD was ambiguous along with the decision taken. Read both before writing anything.
 
@@ -25,12 +27,13 @@ This is a resume-artifact MVP with a hard deadline (Thursday Sept 10, 2026, 11:0
 
 - `make db-up` / `make db-down` / `make db-reset` — postgres container (db-reset drops the volume)
 - `make migrate` — apply migrations (`go run ./cmd/api -migrate-only`)
-- `make dev` — run the api on the host; `make run` (phase 5) will be `docker compose up --build`
+- `make dev` — run the api on the host; it sources `.env` itself, as does `make seed-admin`
+- `make run` — `docker compose up --build`: postgres first, then the api once postgres is *healthy*
 - `make test` — unit only
-- `make test-integration` — unit + integration (build tag `integration`; **requires `DATABASE_URL`** and fails loudly without it)
-- `make lint` — `go vet ./...` plus staticcheck (pinned v0.8.1; older releases cannot decode Go 1.25+ export data)
+- `make test-integration` — unit + integration (build tag `integration`; **requires `DATABASE_URL`** and fails loudly without it). It does not run against that database — see `internal/dbtest` below
+- `make lint` — `go vet` plus staticcheck (pinned v0.8.1; older releases cannot decode Go 1.25+ export data). Both run with `-tags=integration`, or neither would read a single DB-backed test file. staticcheck alone runs under `GOTOOLCHAIN=auto`: its module declares `go 1.26.0`, above go.mod's floor, so the repo-wide `local` pin would break `make lint` on any machine — CI included — running exactly the Go go.mod asks for
 - `make docker-build` — production image, prints its size
-- `make seed-admin` — phase 4; idempotent admin from `ADMIN_EMAIL` / `ADMIN_PASSWORD`
+- `make seed-admin` — idempotent admin from `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `.env`
 
 Single test: `go test ./internal/workflow -run TestTransition -v`. Integration only: `go test -tags=integration ./... -run TestX`.
 
@@ -50,14 +53,25 @@ Three invariants there that are easy to undo by accident, each pinned by a test 
 - `NewIssuer` rejects a `JWT_SECRET` under 32 bytes (RFC 7518 §3.2). HS256 is only as strong as its key.
 - Every auth failure is one identical 401 body, and `auth.DummyCheck` keeps unknown-email login *timing* identical too. Do not add a more helpful message.
 
-`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding and the `{"error": "..."}` response shape (request-id echo lands in phase 4 with the router). `httpx.Decode` caps bodies at 1 MB, rejects unknown fields and trailing content, and returns a `*httpx.Error` carrying the status — so handlers call `httpx.WriteDecodeError(w, err)` and an oversized body is a 413 rather than a blanket 400. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
+`internal/dbtest` provisions the database the integration suites run against. Both suites open by dropping the public schema, so they must never be pointed at the one `DATABASE_URL` names: `dbtest.URL` derives a `jobtracker_test` sibling from it — swapping the database name and nothing else, so host, port, credentials and sslmode carry over — and creates it on the fly, while `dbtest.Reset` opens its own connection and checks `current_database()` before dropping anything. A test run never touches the dev database; `TestReset_RefusesAnyOtherDatabase` is what keeps that true.
+
+`internal/db` owns the pgx pool and migrate runner; `internal/httpx` owns JSON encoding, the `{"error": "..."}` response shape, and `EchoRequestID`, which returns chi's request id in an `X-Request-Id` **header** — not in the body, because the PRD fixes the error shape. `httpx.Decode` caps bodies at 1 MB, rejects unknown fields and trailing content, and returns a `*httpx.Error` carrying the status — so handlers call `httpx.WriteDecodeError(w, err)` and an oversized body is a 413 rather than a blanket 400. All config comes from env vars only (`DATABASE_URL`, `JWT_SECRET`, `PORT`) — no config files.
 
 **Search** — `applications.search_vec` is a *generated stored* tsvector column over role_title/location/notes with a GIN index. Note the two-argument `to_tsvector('english', ...)`: the one-argument form is only STABLE and a generated column requires IMMUTABLE.
 
 `?q=` is a **UNION of two ranked branches**, not one OR'd predicate (PRD §Endpoints): the tsvector branch ranked by `ts_rank`, and a `companies.name ilike` branch at a fixed rank of 1.0, `union all`-ed and deduplicated by `max(rank)` per id. Splitting them is what keeps the tsvector predicate index-eligible — OR-ing an unindexed `ilike` into the same `where` defeats the GIN index, and `EXPLAIN` must still show a Bitmap Index Scan on `applications_search_idx`.
 
+Two planner facts that integration test 12 depends on, both measured rather than assumed, and both worth being able to explain:
+
+- **A GIN index must be vacuumed before its cost looks right.** New entries sit in a pending list until vacuum merges them, and the planner prices a scan over an unmerged list at what reading the list would cost. Same index, same rows: cost **127.56 before `VACUUM`, 12.84 after** — the difference between the planner rejecting `applications_search_idx` and choosing it. `ANALYZE` does not flush it. Any test or benchmark that bulk-inserts and then reasons about a plan has to `vacuum` first.
+- **`applications_user_idx` competes with the GIN index on the owner-scoped query**, and which wins turns on term selectivity, not table size. On 2000 rows owned by one user, a term matching 1 row in 10 plans as an Index Scan on `applications_user_idx` with the tsvector predicate as a `Filter`; 1 row in 500 plans as a Bitmap Index Scan on `applications_search_idx`. Both are correct — a term matching a tenth of the table is not what a GIN index is for. Don't "fix" the first case.
+
 **Companies** are a separate normalized table; `POST /applications` upserts by name (`on conflict (name) do update ... returning id`) rather than storing a company string per row.
+
+**Routing** lives in `internal/server/router.go`, not `main.go`, because `package main` can't be imported and a test that rewires its own routes stops testing the ones that ship. Every authenticated route sits inside one `r.Group`, so the default for a new route added in that block is "protected" rather than "public". `middleware.RealIP` is deliberately absent — it trusts a spoofable `X-Forwarded-For` and nothing here keys off the client address. `router_test.go` builds the real router over a nil pool and asserts each protected route 401s **with `WWW-Authenticate: Bearer`**; handlers also refuse a request with no principal, so without that header check a route mounted outside the group would still look like a pass.
 
 ## CI/CD
 
-`ci.yml` runs on PRs and pushes to `main`: vet + staticcheck, then integration tests against a `services: postgres:16` container. `deploy.yml` fires only after CI succeeds on `main` and just curls `$RENDER_DEPLOY_HOOK_URL`. Tests should stay under 60s in CI. Render builds the `Dockerfile` (multi-stage golang builder → distroless/static, `CGO_ENABLED=0`; the builder tag must be >= the `go` directive in go.mod); the database is Supabase Postgres via the pooler with `sslmode=require`.
+`ci.yml` (`name: CI` — `deploy.yml`'s `workflow_run` matches that string character for character) runs on PRs and pushes to `main`. It calls `make lint` and `make test-integration` rather than open-coding `go vet` and a staticcheck action, deliberately: the Makefile targets carry `-tags=integration`, and a CI step that drops it lints none of the DB-backed tests while still reporting green. Go comes from `go-version-file: go.mod`; Postgres is a `services: postgres:16` container whose health check gates the first step, which is what replaces `make db-up`'s wait loop. `deploy.yml` fires only on a **successful** CI run on `main` and curls `$RENDER_DEPLOY_HOOK_URL`, passed through `env:` so the URL — which is itself the credential — never becomes part of a shell command. Tests should stay under 60s in CI (~16s locally). Render builds the `Dockerfile` (multi-stage golang builder → distroless/static, `CGO_ENABLED=0`; the builder tag must be >= the `go` directive in go.mod); the database is Supabase Postgres via the session pooler with `sslmode=require`.
+
+Compose runs both services. `api` waits on `condition: service_healthy`, reads `.env` optionally (`required: false`, so a fresh clone can still `make db-up` without one) and overrides `DATABASE_URL` and `PORT` inline — inside the network Postgres answers to `postgres`, while `.env` carries the localhost form every host-side target needs.

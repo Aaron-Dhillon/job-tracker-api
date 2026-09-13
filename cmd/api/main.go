@@ -1,8 +1,6 @@
-// Command api is the job tracker HTTP server. It applies database migrations on
-// start before listening, so a container deploy is self-contained.
-//
-// Phase 1-3 skeleton: configuration, migrations, and /healthz only. Route
-// wiring moves to internal/server in phase 4.
+// Command api is the job tracker HTTP server. It applies database migrations
+// on start before listening, so a container deploy is self-contained and
+// Render needs no separate migration step.
 package main
 
 import (
@@ -16,24 +14,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/auth"
 	"github.com/Aaron-Dhillon/job-tracker-api/internal/db"
-	"github.com/Aaron-Dhillon/job-tracker-api/internal/httpx"
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/server"
+	"github.com/Aaron-Dhillon/job-tracker-api/internal/users"
 )
 
 func main() {
 	migrateOnly := flag.Bool("migrate-only", false, "apply migrations and exit")
+	seedAdmin := flag.Bool("seed-admin", false, "upsert the admin from ADMIN_EMAIL/ADMIN_PASSWORD and exit")
 	flag.Parse()
 
-	if err := run(*migrateOnly); err != nil {
+	if err := run(*migrateOnly, *seedAdmin); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
 }
 
-func run(migrateOnly bool) error {
+func run(migrateOnly, seedAdmin bool) error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
@@ -52,6 +51,13 @@ func run(migrateOnly bool) error {
 		return nil
 	}
 
+	// Built before the pool so a short or missing JWT_SECRET fails at startup
+	// with a clear message, rather than on the first login attempt.
+	issuer, err := auth.NewIssuer(os.Getenv("JWT_SECRET"), auth.DefaultTTL)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -61,9 +67,48 @@ func run(migrateOnly bool) error {
 	}
 	defer pool.Close()
 
+	if err := ensureAdmin(ctx, pool, seedAdmin); err != nil {
+		return err
+	}
+	if seedAdmin {
+		return nil
+	}
+
+	return serve(server.New(pool, issuer), port)
+}
+
+// ensureAdmin upserts the seed admin when ADMIN_EMAIL and ADMIN_PASSWORD are
+// both set.
+//
+// On startup an unset pair is simply nothing to do -- the API is perfectly
+// usable without an admin. Under -seed-admin it is a failure, because creating
+// that account is the only thing the command was asked to do, and exiting 0
+// having done nothing is how a missing admin goes unnoticed until a demo.
+func ensureAdmin(ctx context.Context, pool *pgxpool.Pool, required bool) error {
+	email, password := os.Getenv("ADMIN_EMAIL"), os.Getenv("ADMIN_PASSWORD")
+
+	if email == "" || password == "" {
+		if required {
+			return users.ErrAdminNotConfigured
+		}
+		return nil
+	}
+
+	admin, err := users.EnsureAdmin(ctx, users.NewRepo(pool), email, password)
+	if err != nil {
+		return err
+	}
+	log.Printf("admin account ready: %s", admin.Email)
+	return nil
+}
+
+// serve runs the HTTP server until SIGTERM, then drains in-flight requests.
+// Render sends SIGTERM on every deploy, so without this each release would cut
+// off whatever was mid-flight.
+func serve(handler http.Handler, port string) error {
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           router(pool),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -88,33 +133,5 @@ func run(migrateOnly bool) error {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer stopCancel()
 		return srv.Shutdown(stopCtx)
-	}
-}
-
-func router(pool *pgxpool.Pool) http.Handler {
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	// No RealIP: it is deprecated and IP-spoofable, and nothing here keys off
-	// the client address (rate limiting is out of scope).
-	r.Use(middleware.Recoverer)
-
-	r.Get("/healthz", healthz(pool))
-	return r
-}
-
-// healthz reports 503 when the database is unreachable. A health check that
-// always returns ok is not a health check -- Render keys its deploy gating and
-// restarts off this endpoint.
-func healthz(pool *pgxpool.Pool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-
-		if err := pool.Ping(ctx); err != nil {
-			log.Printf("healthz: ping failed: %v", err)
-			httpx.WriteError(w, http.StatusServiceUnavailable, "database unavailable")
-			return
-		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }

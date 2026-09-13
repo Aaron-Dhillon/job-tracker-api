@@ -1,0 +1,38 @@
+name: Deploy
+
+on:
+  # Not `push: branches: [main]`. Deploying has to wait for CI's verdict, and a
+  # push trigger has no way to see one.
+  #
+  # Two things about workflow_run that are easy to lose an hour to: the name
+  # below must match ci.yml's `name:` character for character, and the trigger
+  # only fires for a workflow file that already exists on the default branch --
+  # so the merge that lands this file deploys nothing. The next one is the
+  # first real deploy.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# Nothing here reads or writes the repository; the job is one outbound request.
+permissions: {}
+
+jobs:
+  deploy:
+    name: trigger render
+    runs-on: ubuntu-latest
+    # workflow_run fires on a failed run just as readily as a passing one, so
+    # without this guard a red build on main would still ship.
+    if: github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Trigger the Render deploy hook
+        env:
+          # Passed as an environment variable rather than interpolated into the
+          # run: line, so the URL -- which is itself the credential -- never
+          # becomes part of a shell command.
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        # -f turns Render's 4xx into a failed job. Without it curl reports
+        # success having printed an error body, and a broken hook looks green
+        # for as long as nobody checks the running version.
+        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"

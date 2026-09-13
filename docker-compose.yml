@@ -15,5 +15,30 @@ services:
       timeout: 5s
       retries: 10
 
+  api:
+    build: .
+    depends_on:
+      postgres:
+        # Not just "started". The api runs migrations before it listens, so a
+        # container that comes up while Postgres is still initialising dies on
+        # a connection refused -- and the first thing anyone types is `make run`.
+        condition: service_healthy
+    env_file:
+      # Optional so `make db-up` works in a fresh clone. Without it the api
+      # container starts and exits on "jwt secret must be at least 32 bytes",
+      # which is the right thing to read when you skipped `cp .env.example .env`.
+      - path: .env
+        required: false
+    environment:
+      # These two override whatever .env holds, and must. Inside the compose
+      # network Postgres answers to `postgres`, while .env carries the
+      # localhost form that `make dev`, `make migrate` and the tests need --
+      # one file cannot be right for both. Pinning PORT keeps the published
+      # port below correct however .env is edited.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/jobtracker?sslmode=disable
+      PORT: 8080
+    ports:
+      - "8080:8080"
+
 volumes:
   pgdata:
