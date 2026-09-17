@@ -11,11 +11,13 @@ every phase and show the output.
 
 ## Current state
 
-All six phases are built. Phases 1-5 are verified end to end. Phase 6's two workflows and the README exist and lint clean, but nothing has run on GitHub: the work sits on the unpushed branch `ci-cd`.
+All six phases are built, verified end to end, and merged to `main` (PR #1 the CI/CD phase, PR #2 the integration-database flake fix).
 
-Deployed to Render at https://job-tracker-api-8zqe.onrender.com against Supabase — though that deployment is still the Phase-1 `/healthz` skeleton.
+The Render deploy at https://job-tracker-api-8zqe.onrender.com, against Supabase, runs the **full API** — not the Phase-1 skeleton it started as. Confirmed 2026-09-16 by read-only probe: `/healthz` 200, protected routes 401 with `WWW-Authenticate: Bearer`, unknown routes JSON 404. The admin account is seeded in production from `ADMIN_EMAIL` / `ADMIN_PASSWORD` on Render.
 
-**Before the first Phase-4+ deploy:** `JWT_SECRET` on Render must be at least 32 bytes or the container refuses to start (see `auth.MinSecretLen`), and the repo needs a `RENDER_DEPLOY_HOOK_URL` secret. Mind the `workflow_run` rule too: the merge that lands `deploy.yml` on `main` does not trigger it — the next one does.
+CI/CD is proven, not just written: CI green on both PRs and on `main`, and `Deploy` fired through `workflow_run` on the second merge and succeeded. As predicted, the merge that *landed* `deploy.yml` on `main` did not trigger it — that rule has now been paid for once; don't debug it again. `RENDER_DEPLOY_HOOK_URL` is set as a repo secret.
+
+Two things that stay true of the live environment: `JWT_SECRET` on Render must be at least 32 bytes or the container refuses to start (`auth.MinSecretLen`), and rotating `ADMIN_PASSWORD` re-seeds the admin on the next boot rather than creating a second account.
 
 `docs/PRD.md` is the authoritative spec. `docs/PLAN.md` is the six-phase build order derived from it — it records which files each phase adds, the tests that prove it, and every place the PRD was ambiguous along with the decision taken. Read both before writing anything.
 
